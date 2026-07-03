@@ -1,0 +1,16 @@
+# Secrets – NIEMALS committen!
+.env
+monitor_urls.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
