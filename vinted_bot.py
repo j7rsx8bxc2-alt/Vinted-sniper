@@ -199,10 +199,29 @@ async def help_cmd(ctx):
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "de-DE,de;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    "Referer": "https://www.vinted.de/",
 }
+
+# Vinted verlangt einen gültigen Session-Cookie bevor die API antwortet.
+# Wir "besuchen" daher zuerst die normale Startseite über denselben Proxy,
+# sammeln den Cookie ein und nutzen ihn danach für den API-Request.
+async def get_session_cookie(session: aiohttp.ClientSession, proxy_url, proxy_auth) -> str | None:
+    try:
+        async with session.get(
+            "https://www.vinted.de/",
+            headers={"User-Agent": HEADERS["User-Agent"]},
+            proxy=proxy_url, proxy_auth=proxy_auth,
+            timeout=aiohttp.ClientTimeout(total=12)
+        ) as r:
+            cookies = r.cookies
+            if cookies:
+                return "; ".join(f"{k}={v.value}" for k, v in cookies.items())
+    except aiohttp.ClientError as e:
+        log.debug(f"Cookie-Abruf fehlgeschlagen: {e}")
+    return None
 
 async def fetch_items(session: aiohttp.ClientSession, url: str, retries: int = 3) -> list:
     for attempt in range(retries):
@@ -210,8 +229,15 @@ async def fetch_items(session: aiohttp.ClientSession, url: str, retries: int = 3
         proxy_url  = p["url"]  if p else None
         proxy_auth = p["auth"] if p else None
         try:
+            # Schritt 1: Session-Cookie über denselben Proxy holen
+            cookie_header = await get_session_cookie(session, proxy_url, proxy_auth)
+            req_headers = dict(HEADERS)
+            if cookie_header:
+                req_headers["Cookie"] = cookie_header
+
+            # Schritt 2: eigentliche API-Anfrage mit Cookie
             async with session.get(
-                url, headers=HEADERS,
+                url, headers=req_headers,
                 proxy=proxy_url, proxy_auth=proxy_auth,
                 timeout=aiohttp.ClientTimeout(total=12)
             ) as r:
@@ -223,6 +249,9 @@ async def fetch_items(session: aiohttp.ClientSession, url: str, retries: int = 3
                     await asyncio.sleep(30)
                 elif r.status == 407:
                     log.error(f"🔐 Proxy-Auth fehlgeschlagen ({proxy_url}) – versuche anderen Proxy...")
+                    continue
+                elif r.status in (401, 403):
+                    log.warning(f"HTTP {r.status} (blockiert) → versuche anderen Proxy...")
                     continue
                 else:
                     log.warning(f"HTTP {r.status} → {url[:70]}")
