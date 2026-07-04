@@ -207,8 +207,16 @@ HEADERS = {
 
 # Vinted verlangt einen gültigen Session-Cookie bevor die API antwortet.
 # Wir "besuchen" daher zuerst die normale Startseite über denselben Proxy,
-# sammeln den Cookie ein und nutzen ihn danach für den API-Request.
+# sammeln den Cookie ein und cachen ihn kurzzeitig (spart Requests/Proxy-Last).
+_cookie_cache: dict[str, tuple[str, float]] = {}
+COOKIE_TTL = 300  # Sekunden, wie lange ein Cookie pro Proxy wiederverwendet wird
+
 async def get_session_cookie(session: aiohttp.ClientSession, proxy_url, proxy_auth) -> str | None:
+    now = asyncio.get_event_loop().time()
+    cache_key = proxy_url or "no-proxy"
+    cached = _cookie_cache.get(cache_key)
+    if cached and (now - cached[1]) < COOKIE_TTL:
+        return cached[0]
     try:
         async with session.get(
             "https://www.vinted.de/",
@@ -218,7 +226,9 @@ async def get_session_cookie(session: aiohttp.ClientSession, proxy_url, proxy_au
         ) as r:
             cookies = r.cookies
             if cookies:
-                return "; ".join(f"{k}={v.value}" for k, v in cookies.items())
+                cookie_header = "; ".join(f"{k}={v.value}" for k, v in cookies.items())
+                _cookie_cache[cache_key] = (cookie_header, now)
+                return cookie_header
     except aiohttp.ClientError as e:
         log.debug(f"Cookie-Abruf fehlgeschlagen: {e}")
     return None
@@ -267,20 +277,32 @@ COUNTRY_FLAGS = {
     "LU": "🇱🇺", "CZ": "🇨🇿", "PT": "🇵🇹"
 }
 
-def format_price(price, currency) -> str:
+def extract_price(item: dict) -> tuple[str, str]:
+    """Vinted liefert 'price' inzwischen als verschachteltes Objekt
+    {'amount': '20.0', 'currency_code': 'EUR'} statt als einfache Zahl."""
+    price_raw = item.get("price", {})
+    if isinstance(price_raw, dict):
+        amount   = price_raw.get("amount", "?")
+        currency = price_raw.get("currency_code", "EUR")
+    else:
+        amount   = price_raw
+        currency = item.get("currency", "EUR")
+    currency_symbol = {"EUR": "€", "USD": "$", "GBP": "£", "PLN": "zł", "CZK": "Kč"}.get(currency, currency)
+    return str(amount), currency_symbol
+
+def format_price(amount, currency) -> str:
     try:
-        val = float(str(price).replace(",", "."))
+        val = float(str(amount).replace(",", "."))
         converted = val * 1.12  # grobe Schätzung inkl. Käuferschutz
         return f"{val:.2f} {currency} ( ≈ {converted:.2f} {currency} )"
     except (ValueError, TypeError):
-        return f"{price} {currency}"
+        return f"{amount} {currency}"
 
 # ── Embed mit Buttons und Bilder-Grid ──────────────────────────────────────────
 async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str):
     item_id    = str(item.get("id", "?"))
     title      = item.get("title", "Unbekannter Artikel")
-    price      = item.get("price", "?")
-    currency   = item.get("currency", "€")
+    amount, currency = extract_price(item)
     size       = item.get("size_title", "–")
     brand      = item.get("brand_title", "–")
     condition  = item.get("status", "–")
@@ -303,7 +325,7 @@ async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str)
 
     # ── Hauptembed: Verkäufer + Titel + Beschreibung ────────────────────────────
     embed = discord.Embed(
-        title=f"{flag} {title} | {price} {currency}",
+        title=f"{flag} {title} | {amount} {currency}",
         url=item_url,
         description=f"👤 **{seller}**",
         color=0x09B1BA
@@ -313,7 +335,7 @@ async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str)
     embed.add_field(name="🏷️ Marke",        value=brand,          inline=True)
     embed.add_field(name="📦 Zustand",      value=condition,      inline=True)
     embed.add_field(name="🌟 Bewertung",    value=f"({rating_stars})", inline=True)
-    embed.add_field(name="💰 Preis",        value=format_price(price, currency), inline=True)
+    embed.add_field(name="💰 Preis",        value=format_price(amount, currency), inline=True)
 
     if photo_urls:
         embed.set_thumbnail(url=photo_urls[0])
@@ -363,8 +385,8 @@ async def sniper_loop():
                                 await send_item(channel, item, monitor_name)
                     except Exception as e:
                         log.error(f"[{monitor_name}] Fehler: {e}")
-                    await asyncio.sleep(random.uniform(1.5, 3.5))
-            await asyncio.sleep(5)
+                    await asyncio.sleep(random.uniform(20, 35))
+            await asyncio.sleep(60)
 
 # ── Start ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
