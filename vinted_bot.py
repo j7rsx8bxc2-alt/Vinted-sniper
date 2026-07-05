@@ -362,31 +362,51 @@ async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str)
         await channel.send(embed=embed, view=view)
 
 # ── Sniper Loop ───────────────────────────────────────────────────────────────
+# Statt alle Kanäle nacheinander abzuklappern, läuft jeder Monitor als eigener
+# Task parallel. Ein Semaphore begrenzt gleichzeitige Proxy-Requests, damit wir
+# Webshare nicht wieder mit zu vielen Requests/Sekunde überlasten (402-Fehler).
+MAX_CONCURRENT_REQUESTS = 5
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+async def monitor_loop(session: aiohttp.ClientSession, monitor_name: str):
+    """Ein eigener Dauer-Loop pro Monitor/Kanal – läuft unabhängig von den anderen."""
+    while True:
+        urls = MONITORS.get(monitor_name, [])
+        if not urls:
+            await asyncio.sleep(30)
+            continue
+        channel = discord.utils.get(bot.get_all_channels(), name=monitor_name)
+        if not channel:
+            await asyncio.sleep(30)
+            continue
+        for url in urls:
+            try:
+                async with request_semaphore:
+                    items = await fetch_items(session, url)
+                for item in items:
+                    item_id = str(item.get("id"))
+                    if item_id and item_id not in seen_set:
+                        if len(seen_items) == MAX_SEEN:
+                            seen_set.discard(seen_items[0])
+                        seen_items.append(item_id)
+                        seen_set.add(item_id)
+                        await send_item(channel, item, monitor_name)
+            except Exception as e:
+                log.error(f"[{monitor_name}] Fehler: {e}")
+            # Moderate Pause je URL innerhalb eines Monitors
+            await asyncio.sleep(random.uniform(8, 15))
+        # Pause bevor dieser Monitor erneut alle seine URLs prüft
+        await asyncio.sleep(random.uniform(10, 20))
+
 async def sniper_loop():
-    log.info("🚀 Sniper-Loop gestartet.")
+    log.info("🚀 Sniper-Loop gestartet (parallele Monitore).")
     async with aiohttp.ClientSession() as session:
-        while True:
-            for monitor_name, urls in MONITORS.items():
-                if not urls:
-                    continue
-                channel = discord.utils.get(bot.get_all_channels(), name=monitor_name)
-                if not channel:
-                    continue
-                for url in urls:
-                    try:
-                        items = await fetch_items(session, url)
-                        for item in items:
-                            item_id = str(item.get("id"))
-                            if item_id and item_id not in seen_set:
-                                if len(seen_items) == MAX_SEEN:
-                                    seen_set.discard(seen_items[0])
-                                seen_items.append(item_id)
-                                seen_set.add(item_id)
-                                await send_item(channel, item, monitor_name)
-                    except Exception as e:
-                        log.error(f"[{monitor_name}] Fehler: {e}")
-                    await asyncio.sleep(random.uniform(20, 35))
-            await asyncio.sleep(60)
+        tasks = [
+            asyncio.create_task(monitor_loop(session, name))
+            for name in MONITORS.keys()
+        ]
+        await asyncio.gather(*tasks)
+
 
 # ── Start ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
