@@ -76,6 +76,7 @@ def save_monitors(monitors):
 MONITORS   = load_monitors()
 seen_items : deque = deque(maxlen=MAX_SEEN)
 seen_set   : set   = set()
+_active_session: aiohttp.ClientSession | None = None  # wird beim Start des Sniper-Loops gesetzt
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -126,16 +127,22 @@ async def on_command_error(ctx, error):
 @bot.command()
 async def add(ctx, monitor: str, *, url: str):
     monitor = monitor.lower()
-    if monitor not in MONITORS:
-        available = ", ".join(f"`{m}`" for m in MONITORS)
-        await ctx.send(f"❌ Unbekannter Monitor.\nVerfügbar: {available}")
-        return
+    is_new = monitor not in MONITORS
+    if is_new:
+        MONITORS[monitor] = []
     if url in MONITORS[monitor]:
         await ctx.send(f"⚠️ Diese URL ist in **#{monitor}** bereits vorhanden.")
         return
     MONITORS[monitor].append(url)
     save_monitors(MONITORS)
-    await ctx.send(f"✅ Suche zu **#{monitor}** hinzugefügt!")
+
+    if is_new and _active_session is not None:
+        # Neuer Monitor-Name -> sofort einen eigenen Loop dafür starten
+        asyncio.create_task(monitor_loop(_active_session, monitor))
+        log.info(f"🆕 Neuer Monitor '{monitor}' zur Laufzeit gestartet.")
+
+    prefix = "🆕 Neuer Kanal erkannt und " if is_new else ""
+    await ctx.send(f"✅ {prefix}Suche zu **#{monitor}** hinzugefügt!")
 
 @bot.command()
 async def remove(ctx, monitor: str, index: int):
@@ -399,8 +406,10 @@ async def monitor_loop(session: aiohttp.ClientSession, monitor_name: str):
         await asyncio.sleep(random.uniform(10, 20))
 
 async def sniper_loop():
+    global _active_session
     log.info("🚀 Sniper-Loop gestartet (parallele Monitore).")
     async with aiohttp.ClientSession() as session:
+        _active_session = session
         tasks = [
             asyncio.create_task(monitor_loop(session, name))
             for name in MONITORS.keys()
