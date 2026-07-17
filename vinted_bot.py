@@ -10,6 +10,8 @@ from collections import deque
 from dotenv import load_dotenv
 
 from cogs.access import admin_only
+from cogs.ai_vision import assess_grail
+from cogs.openrouter_client import is_enabled as ai_enabled
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -345,7 +347,8 @@ def format_price(amount, currency) -> str:
         return f"{amount} {currency}"
 
 # ── Embed mit Buttons und Bilder-Grid ──────────────────────────────────────────
-async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str):
+async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str,
+                     session: aiohttp.ClientSession | None = None):
     item_id    = str(item.get("id", "?"))
     title      = item.get("title", "Unbekannter Artikel")
     amount, currency = extract_price(item)
@@ -369,13 +372,35 @@ async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str)
 
     rating_stars = round(float(rating_raw) * 5, 1)
 
+    # ── Grail-Erkennung: KI schätzt anhand des ersten Fotos ein, ob der Fund
+    # ungewöhnlich selten/begehrt ist (Limited Edition, seltene Colorway, Kult-Stück).
+    # Best-effort: läuft nur wenn ein OpenRouter-Key gesetzt ist, und ein Fehler
+    # hier darf den Sniper nie blockieren – der Fund wird dann einfach ganz normal
+    # ohne 🔥-Badge gepostet.
+    grail = None
+    if photo_urls and session is not None and ai_enabled():
+        try:
+            async with session.get(
+                photo_urls[0], timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    img_bytes = await r.read()
+                    grail = await assess_grail(img_bytes, title, brand)
+        except Exception as e:
+            log.debug(f"Grail-Check Foto-Download fehlgeschlagen: {e}")
+
+    is_grail = bool(grail and grail.get("is_grail"))
+    title_prefix = "🔥 " if is_grail else ""
+
     # ── Hauptembed: Verkäufer + Titel + Beschreibung ────────────────────────────
     embed = discord.Embed(
-        title=f"{flag} {title} | {amount} {currency}",
+        title=f"{title_prefix}{flag} {title} | {amount} {currency}",
         url=item_url,
         description=f"👤 **{seller}**",
-        color=0x09B1BA
+        color=0xFFD700 if is_grail else 0x09B1BA
     )
+    if is_grail and grail.get("grund"):
+        embed.add_field(name="🔥 Seltener Fund", value=grail["grund"], inline=False)
     embed.add_field(name="📅 Aktualisiert", value="Gerade eben", inline=True)
     embed.add_field(name="📏 Größe",        value=size,           inline=True)
     embed.add_field(name="🏷️ Marke",        value=brand,          inline=True)
@@ -436,7 +461,7 @@ async def monitor_loop(session: aiohttp.ClientSession, monitor_name: str):
                             seen_set.discard(seen_items[0])
                         seen_items.append(item_id)
                         seen_set.add(item_id)
-                        await send_item(channel, item, monitor_name)
+                        await send_item(channel, item, monitor_name, session=session)
             except Exception as e:
                 log.error(f"[{monitor_name}] Fehler: {e}")
             # Moderate Pause je URL innerhalb eines Monitors
