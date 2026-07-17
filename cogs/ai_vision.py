@@ -270,6 +270,44 @@ async def describe_garment(image_bytes: bytes) -> Optional[str]:
     return text or None
 
 
+# ── Grail-Erkennung (Sniper) ─────────────────────────────────────────────────
+GRAIL_PROMPT = """Du bist Experte für seltene, begehrte Vintage-/Streetwear-Stücke im Reselling.
+Schau dir dieses Vinted-Fundstück an (Titel: "{title}", Marke: "{brand}") und schätz ein, ob es sich
+um ein besonders seltenes oder begehrtes Stück handelt (z.B. Limited Edition, seltene Colorway,
+bekanntes Archiv-/Kollab-Stück, kultiger Print, ungewöhnlich seltene Größe eines gefragten Modells).
+
+Antworte AUSSCHLIESSLICH mit einem JSON-Objekt in genau diesem Format (kein Markdown, kein Codeblock,
+kein Fließtext davor/danach):
+{{
+  "is_grail": true oder false,
+  "grund": "kurze Begründung auf Deutsch (max. 1 Satz), NUR falls is_grail true ist, sonst leerer String"
+}}
+
+Sei zurückhaltend – markiere nur wirklich auffällige/seltene Stücke als Grail, nicht jedes normale
+Markenteil. Die meisten Funde sind KEIN Grail."""
+
+
+async def assess_grail(image_bytes: bytes, title: str, brand: str) -> Optional[dict]:
+    """Schätzt anhand des ersten Fotos ein, ob ein frisch gesnipter Artikel ein seltenes
+    'Grail'-Stück ist. Gibt None zurück wenn kein API-Key gesetzt ist oder die Anfrage
+    fehlschlägt – der Sniper postet den Fund dann einfach ganz normal ohne 🔥-Badge weiter,
+    das darf den Sniper nie blockieren oder verlangsamen bei Fehlern."""
+    if not is_enabled():
+        return None
+    try:
+        prompt = GRAIL_PROMPT.format(title=(title or "")[:200], brand=brand or "unbekannt")
+        content = [{"type": "text", "text": prompt}, _image_content(image_bytes)]
+        text = await chat([{"role": "user", "content": content}], temperature=0.2)
+        result = _extract_json(text)
+        return {
+            "is_grail": bool(result.get("is_grail", False)),
+            "grund": str(result.get("grund", "")).strip(),
+        }
+    except Exception as e:
+        log.warning(f"Grail-Check fehlgeschlagen, überspringe: {e}")
+        return None
+
+
 def build_photo_check_embed(result: dict) -> discord.Embed:
     score = result.get("score")
     if isinstance(score, (int, float)):
