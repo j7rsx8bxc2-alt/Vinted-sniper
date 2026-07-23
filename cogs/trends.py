@@ -283,9 +283,15 @@ async def _fetch_total_count(term: str) -> int:
     proxy_url = p["url"] if p else None
     proxy_auth = p["auth"] if p else None
 
+    # per_page bewusst auf 20 statt 1 gesetzt und sonst identisch zu den
+    # echten Snipe-Bot-URLs aufgebaut: ein "per_page=1"-Request sieht für
+    # Vinteds Anti-Bot-Erkennung sehr untypisch aus (das macht kein echter
+    # Browser), und wurde vermutlich deswegen sofort mit einer generischen
+    # Fallback-Antwort abgespeist statt echten Zahlen — das würde erklären,
+    # warum selbst der 1./2. Request in einem frischen Lauf schon betroffen war.
     params = {
         "search_text": term,
-        "per_page": "1",
+        "per_page": "20",
         "order": "newest_first",
     }
 
@@ -307,11 +313,22 @@ async def _fetch_total_count(term: str) -> int:
             data = await r.json()
             pagination = data.get("pagination") or {}
             total = pagination.get("total_entries")
+            items = data.get("items", [])
+            # Sanity-Check: meldet Vinted z.B. 960 Treffer, liefert aber gar
+            # keine Items zurück (obwohl per_page=20 bis zu 20 anfordert), ist
+            # das sehr wahrscheinlich eine generische Fallback-/Blocker-Antwort
+            # und kein echtes Suchergebnis — dann lieber als Fehler behandeln,
+            # damit er nicht als "echte" Zahl durchrutscht.
             if total is not None:
+                if total > 0 and not items:
+                    raise TrendsError(
+                        f"Verdächtige Antwort: {total} Treffer gemeldet, aber 0 Items geliefert "
+                        "(vermutlich Block/Fallback-Antwort)."
+                    )
                 return int(total)
             # Fallback falls Vinted mal kein pagination-Feld liefert – grobe
             # Schätzung über die zurückgegebene Item-Liste.
-            return len(data.get("items", []))
+            return len(items)
 
 
 class Trends(commands.Cog):
