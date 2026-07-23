@@ -1,4 +1,3 @@
-
 """
 Trend-Radar – verfolgt automatisch, wie sich die Anzahl aktiver
 Vinted-Angebote zu den Marken/Kategorien verändert, die im Snipe-Bot aktiv
@@ -194,7 +193,7 @@ def _auto_terms() -> list[str]:
 # Breite Markt-Abdeckung, unabhängig davon was du selbst gerade snipst –
 # Vinted bietet KEINE echte "was ist gerade angesagt"-Funktion an (keine
 # öffentliche Trending-API, nur Suche pro Begriff). Das hier ist die
-# nächstbeste Annäherung: eine große Liste bekannter Vintage-/Streetwear-
+# nächstbeste Annäherung: eine große, feste Liste bekannter Vintage-/Streetwear-
 # Resale-Marken wird mitgetrackt, damit die tägliche Bewegung nicht nur
 # deine eigenen Suchbegriffe zeigt, sondern die größten Marken-Gewinner
 # über den ganzen Vintage-Markt hinweg – ohne dass du selbst was eingeben musst.
@@ -484,17 +483,39 @@ class Trends(commands.Cog):
         await ctx.send(embed=embed)
 
     # ── Gemeinsame Logik für Tages-Update & Wochenrecap ──────────────────────
-    async def _collect_results(self, baseline_fn) -> list[dict]:
+    async def _collect_results(self, baseline_fn) -> tuple[list[dict], bool]:
+        """Gibt (results, blocked) zurück. blocked=True heißt: Vinted hat den Lauf
+        vermutlich abgeblockt (siehe Kommentar unten) und der Rest des Laufs wurde
+        abgebrochen, statt unzuverlässige Zahlen zu posten."""
         terms = await asyncio.to_thread(_effective_terms)
         if not terms:
-            return []
+            return [], False
         results = []
+        last_total = None
+        blocked = False
         for i, term in enumerate(terms):
             try:
                 total = await _fetch_total_count(term)
             except Exception:
                 log.warning(f"Trend-Check für '{term}' fehlgeschlagen, überspringe.")
                 continue
+
+            # Sicherheits-Check: liefern zwei unterschiedliche Suchbegriffe direkt
+            # hintereinander exakt denselben Wert, blockt Vinted die Anfrage
+            # vermutlich gerade (liefert eine generische Fallback-Antwort mit
+            # HTTP 200 statt echter Suchergebnisse, z.B. bei zu vielen Anfragen in
+            # kurzer Zeit). Das ist bei zwei unterschiedlichen Marken statistisch
+            # praktisch ausgeschlossen, wenn es echte Zahlen wären. Dann lieber
+            # abbrechen, als eine Liste voller Fake-Zahlen zu posten.
+            if last_total is not None and total == last_total:
+                log.warning(
+                    f"Trend-Check abgebrochen bei '{term}': identischer Wert ({total}) wie beim "
+                    "vorherigen Begriff — Vinted blockt vermutlich gerade, Rest des Laufs übersprungen."
+                )
+                blocked = True
+                break
+            last_total = total
+
             baseline = await asyncio.to_thread(baseline_fn, term)
             await asyncio.to_thread(_insert_snapshot, term, total)
             if baseline:
@@ -505,16 +526,17 @@ class Trends(commands.Cog):
                 diff = pct = None
             sales = await asyncio.to_thread(_buchhaltung_sales_stats, term)
             results.append({"term": term, "total": total, "diff": diff, "pct": pct, "sales": sales})
-            # Kleine, zufällige Pause zwischen den Anfragen – jetzt wo die
-            # Markt-Watchlist mit dazu kommt, sind das deutlich mehr Requests
-            # pro Lauf (~70 statt ~20), daher etwas Abstand um Vinted nicht
-            # mit vielen Anfragen in kurzer Zeit aufzufallen.
+            # Zufällige Pause zwischen den Anfragen – jetzt wo die Markt-Watchlist
+            # mit dazu kommt, sind das deutlich mehr Requests pro Lauf (~70 statt
+            # ~20), daher mehr Abstand um Vinted nicht mit vielen Anfragen in
+            # kurzer Zeit aufzufallen.
             if i < len(terms) - 1:
-                await asyncio.sleep(random.uniform(1.5, 3.0))
-        return results
+                await asyncio.sleep(random.uniform(3.0, 6.0))
+        return results, blocked
 
     @staticmethod
-    def _build_trend_embed(title: str, results: list[dict], *, no_baseline_label: str, is_test: bool) -> discord.Embed:
+    def _build_trend_embed(title: str, results: list[dict], *, no_baseline_label: str, is_test: bool,
+                            blocked: bool = False) -> discord.Embed:
         movers = sorted([r for r in results if r["pct"] is not None], key=lambda r: r["pct"], reverse=True)
         new_terms = [r for r in results if r["pct"] is None]
 
@@ -542,13 +564,33 @@ class Trends(commands.Cog):
             embed.add_field(name="Bei dir am besten weg (echte Verkäufe)", value="\n".join(lines), inline=False)
 
         footer = "Angebots-Bewegung = Proxy für Konkurrenz/Interesse. Echte Verkäufe kommen aus deiner Buchhaltung."
+        if blocked:
+            footer = (
+                "⚠️ Lauf vorzeitig abgebrochen — Vinted hat vermutlich geblockt (zu viele Anfragen). "
+                "Die Zahlen oben sind noch die zuverlässigen von vor dem Abbruch. • " + footer
+            )
         if is_test:
             footer = "🧪 Test-Lauf (manuell ausgelöst, nicht der echte Zeitplan) • " + footer
         embed.set_footer(text=footer)
         return embed
 
-    async def _post_result(self, ctx: commands.Context | None, embed: discord.Embed | None):
+    async def _post_result(self, ctx: commands.Context | None, embed: discord.Embed | None, *, blocked: bool = False):
         if embed is None:
+            if blocked:
+                msg = (
+                    "⚠️ Trend-Check abgebrochen — Vinted hat die Anfragen vermutlich geblockt "
+                    "(zu viele Suchen zu schnell hintereinander), bevor auch nur ein zuverlässiger "
+                    "Wert reinkam. Kein Update gepostet, um keine Fake-Zahlen zu zeigen. "
+                    "Probier's einfach nochmal mit `!trends-tagesupdate` oder warte auf den nächsten "
+                    "automatischen Lauf."
+                )
+                if ctx:
+                    await ctx.send(msg)
+                else:
+                    channel = discord.utils.get(self.bot.get_all_channels(), name=TRENDS_CHANNEL_NAME)
+                    if channel:
+                        await channel.send(msg)
+                return
             if ctx:
                 await ctx.send(
                     "📭 Nichts zu tracken — leg mit `!add <kanal> <vinted-url>` einen Snipe-Bot-Kanal an "
@@ -566,14 +608,14 @@ class Trends(commands.Cog):
             log.warning(f"Trend-Update: Kanal '{TRENDS_CHANNEL_NAME}' nicht gefunden.")
 
     async def _run_daily_update(self, ctx: commands.Context = None, is_test: bool = False):
-        results = await self._collect_results(_last_snapshot)
+        results, blocked = await self._collect_results(_last_snapshot)
         embed = None
         if results:
             embed = self._build_trend_embed(
                 "📡 Trend-Update von heute", results,
-                no_baseline_label="Basiswert", is_test=is_test,
+                no_baseline_label="Basiswert", is_test=is_test, blocked=blocked,
             )
-        await self._post_result(ctx, embed)
+        await self._post_result(ctx, embed, blocked=blocked and not results)
 
     async def _run_weekly_recap(self, ctx: commands.Context = None, is_test: bool = False):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -581,14 +623,14 @@ class Trends(commands.Cog):
         def baseline_fn(term: str):
             return _snapshot_before(term, cutoff)
 
-        results = await self._collect_results(baseline_fn)
+        results, blocked = await self._collect_results(baseline_fn)
         embed = None
         if results:
             embed = self._build_trend_embed(
                 "📊 Wochenrecap", results,
-                no_baseline_label="noch keine 7 Tage Historie", is_test=is_test,
+                no_baseline_label="noch keine 7 Tage Historie", is_test=is_test, blocked=blocked,
             )
-        await self._post_result(ctx, embed)
+        await self._post_result(ctx, embed, blocked=blocked and not results)
 
     @tasks.loop(time=DAILY_TIME)
     async def daily_trend_loop(self):
