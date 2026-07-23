@@ -371,12 +371,17 @@ class TrendsError(Exception):
     pass
 
 
-async def _fetch_search(term: str) -> tuple[int, list[dict]]:
+async def _fetch_search(term: str, session: aiohttp.ClientSession) -> tuple[int, list[dict]]:
     """Sucht den Begriff auf Vinted, gibt (total_entries, items) zurück. items
     ist eine Liste von {"id": str, "title": str} (bis zu 20, aus derselben
     Anfrage) — wird sowohl für den Angebots-Zähler als auch fürs
     Verkaufsgeschwindigkeits-Tracking (siehe _upsert_seen_items/_mark_disappeared)
-    genutzt, damit wir nicht doppelt so viele Anfragen brauchen."""
+    genutzt, damit wir nicht doppelt so viele Anfragen brauchen.
+
+    Braucht eine bereits offene aiohttp-Session als Argument (statt intern eine
+    neue aufzumachen) — der Sniper macht das genauso (eine durchgehende Session
+    für alle Anfragen), und viele kurze Einweg-Sessions hintereinander sehen
+    für Vinteds Bot-Erkennung eher verdächtig aus als eine durchgehende."""
     # Import hier drin (nicht am Modulanfang), aus demselben Grund wie in
     # price_check.py: vinted_bot.py ist zur Ladezeit dieser Cog evtl. noch
     # nicht vollständig initialisiert.
@@ -395,49 +400,50 @@ async def _fetch_search(term: str) -> tuple[int, list[dict]]:
         "order": "newest_first",
     }
 
-    async with aiohttp.ClientSession() as session:
-        cookie_header = await get_session_cookie(session, proxy_url, proxy_auth)
-        headers = dict(HEADERS)
-        if cookie_header:
-            headers["Cookie"] = cookie_header
+    cookie_header = await get_session_cookie(session, proxy_url, proxy_auth)
+    headers = dict(HEADERS)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
 
-        async with session.get(
-            SEARCH_URL, params=params, headers=headers,
-            proxy=proxy_url, proxy_auth=proxy_auth,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status != 200:
-                body = await r.text()
-                log.error(f"Trend-Check Fehler (HTTP {r.status}): {body[:300]}")
-                raise TrendsError(f"Vinted antwortete mit HTTP {r.status}.")
-            data = await r.json()
-            pagination = data.get("pagination") or {}
-            total = pagination.get("total_entries")
-            raw_items = data.get("items", [])
-            items = [
-                {"id": str(it["id"]), "title": str(it.get("title") or "")}
-                for it in raw_items if it.get("id") is not None
-            ]
-            # Sanity-Check: meldet Vinted z.B. 960 Treffer, liefert aber gar
-            # keine Items zurück (obwohl per_page=20 bis zu 20 anfordert), ist
-            # das sehr wahrscheinlich eine generische Fallback-/Blocker-Antwort
-            # und kein echtes Suchergebnis — dann lieber als Fehler behandeln,
-            # damit er nicht als "echte" Zahl durchrutscht.
-            if total is not None:
-                if total > 0 and not items:
-                    raise TrendsError(
-                        f"Verdächtige Antwort: {total} Treffer gemeldet, aber 0 Items geliefert "
-                        "(vermutlich Block/Fallback-Antwort)."
-                    )
-                return int(total), items
-            # Fallback falls Vinted mal kein pagination-Feld liefert – grobe
-            # Schätzung über die zurückgegebene Item-Liste.
-            return len(items), items
+    async with session.get(
+        SEARCH_URL, params=params, headers=headers,
+        proxy=proxy_url, proxy_auth=proxy_auth,
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as r:
+        if r.status != 200:
+            body = await r.text()
+            log.error(f"Trend-Check Fehler (HTTP {r.status}): {body[:300]}")
+            raise TrendsError(f"Vinted antwortete mit HTTP {r.status}.")
+        data = await r.json()
+        pagination = data.get("pagination") or {}
+        total = pagination.get("total_entries")
+        raw_items = data.get("items", [])
+        items = [
+            {"id": str(it["id"]), "title": str(it.get("title") or "")}
+            for it in raw_items if it.get("id") is not None
+        ]
+        # Sanity-Check: meldet Vinted z.B. 960 Treffer, liefert aber gar
+        # keine Items zurück (obwohl per_page=20 bis zu 20 anfordert), ist
+        # das sehr wahrscheinlich eine generische Fallback-/Blocker-Antwort
+        # und kein echtes Suchergebnis — dann lieber als Fehler behandeln,
+        # damit er nicht als "echte" Zahl durchrutscht.
+        if total is not None:
+            if total > 0 and not items:
+                raise TrendsError(
+                    f"Verdächtige Antwort: {total} Treffer gemeldet, aber 0 Items geliefert "
+                    "(vermutlich Block/Fallback-Antwort)."
+                )
+            return int(total), items
+        # Fallback falls Vinted mal kein pagination-Feld liefert – grobe
+        # Schätzung über die zurückgegebene Item-Liste.
+        return len(items), items
 
 
 async def _fetch_total_count(term: str) -> int:
-    """Kompatibilitäts-Wrapper für den Ad-hoc-Command !trends (braucht nur die Zahl)."""
-    total, _ = await _fetch_search(term)
+    """Kompatibilitäts-Wrapper für den Ad-hoc-Command !trends (eigene kurzlebige
+    Session ok für einen einzelnen Check, keine Serie von Anfragen)."""
+    async with aiohttp.ClientSession() as session:
+        total, _ = await _fetch_search(term, session)
     return total
 
 
@@ -620,57 +626,62 @@ class Trends(commands.Cog):
         results = []
         last_total = None
         blocked = False
-        for i, term in enumerate(terms):
-            try:
-                total, items = await _fetch_search(term)
-            except Exception:
-                log.warning(f"Trend-Check für '{term}' fehlgeschlagen, überspringe.")
-                continue
+        # EINE durchgehende Session für den kompletten Lauf (statt pro Marke
+        # eine neue) — der Sniper macht das genauso. Viele kurze Einweg-
+        # Sessions hintereinander sehen für Vinteds Bot-Erkennung eher
+        # verdächtig aus als eine durchgehende, wiederverwendete Verbindung.
+        async with aiohttp.ClientSession() as session:
+            for i, term in enumerate(terms):
+                try:
+                    total, items = await _fetch_search(term, session)
+                except Exception:
+                    log.warning(f"Trend-Check für '{term}' fehlgeschlagen, überspringe.")
+                    continue
 
-            # Sicherheits-Check: liefern zwei unterschiedliche Suchbegriffe direkt
-            # hintereinander exakt denselben Wert, blockt Vinted die Anfrage
-            # vermutlich gerade (liefert eine generische Fallback-Antwort mit
-            # HTTP 200 statt echter Suchergebnisse, z.B. bei zu vielen Anfragen in
-            # kurzer Zeit). Das ist bei zwei unterschiedlichen Marken statistisch
-            # praktisch ausgeschlossen, wenn es echte Zahlen wären. Dann lieber
-            # abbrechen, als eine Liste voller Fake-Zahlen zu posten.
-            if last_total is not None and total == last_total:
-                log.warning(
-                    f"Trend-Check abgebrochen bei '{term}': identischer Wert ({total}) wie beim "
-                    "vorherigen Begriff — Vinted blockt vermutlich gerade, Rest des Laufs übersprungen."
-                )
-                blocked = True
-                break
-            last_total = total
+                # Sicherheits-Check: liefern zwei unterschiedliche Suchbegriffe direkt
+                # hintereinander exakt denselben Wert, blockt Vinted die Anfrage
+                # vermutlich gerade (liefert eine generische Fallback-Antwort mit
+                # HTTP 200 statt echter Suchergebnisse, z.B. bei zu vielen Anfragen in
+                # kurzer Zeit). Das ist bei zwei unterschiedlichen Marken statistisch
+                # praktisch ausgeschlossen, wenn es echte Zahlen wären. Dann lieber
+                # abbrechen, als eine Liste voller Fake-Zahlen zu posten.
+                if last_total is not None and total == last_total:
+                    log.warning(
+                        f"Trend-Check abgebrochen bei '{term}': identischer Wert ({total}) wie beim "
+                        "vorherigen Begriff — Vinted blockt vermutlich gerade, Rest des Laufs übersprungen."
+                    )
+                    blocked = True
+                    break
+                last_total = total
 
-            baseline = await asyncio.to_thread(baseline_fn, term)
-            await asyncio.to_thread(_insert_snapshot, term, total)
+                baseline = await asyncio.to_thread(baseline_fn, term)
+                await asyncio.to_thread(_insert_snapshot, term, total)
 
-            # Verkaufsgeschwindigkeits-Tracking: neu gesehene Artikel merken,
-            # und Artikel, die aus den Suchergebnissen verschwunden sind
-            # (= vermutlich verkauft/entfernt) entsprechend markieren.
-            active_ids = {it["id"] for it in items}
-            await asyncio.to_thread(_upsert_seen_items, term, items)
-            await asyncio.to_thread(_mark_disappeared, term, active_ids)
-            velocity = await asyncio.to_thread(_velocity_stats, term)
+                # Verkaufsgeschwindigkeits-Tracking: neu gesehene Artikel merken,
+                # und Artikel, die aus den Suchergebnissen verschwunden sind
+                # (= vermutlich verkauft/entfernt) entsprechend markieren.
+                active_ids = {it["id"] for it in items}
+                await asyncio.to_thread(_upsert_seen_items, term, items)
+                await asyncio.to_thread(_mark_disappeared, term, active_ids)
+                velocity = await asyncio.to_thread(_velocity_stats, term)
 
-            if baseline:
-                prev = baseline["total_count"]
-                diff = total - prev
-                pct = (diff / prev * 100) if prev else 0.0
-            else:
-                diff = pct = None
-            sales = await asyncio.to_thread(_buchhaltung_sales_stats, term)
-            results.append({
-                "term": term, "total": total, "diff": diff, "pct": pct,
-                "sales": sales, "velocity": velocity,
-            })
-            # Zufällige Pause zwischen den Anfragen – jetzt wo die Markt-Watchlist
-            # mit dazu kommt, sind das deutlich mehr Requests pro Lauf (~70 statt
-            # ~20), daher mehr Abstand um Vinted nicht mit vielen Anfragen in
-            # kurzer Zeit aufzufallen.
-            if i < len(terms) - 1:
-                await asyncio.sleep(random.uniform(3.5, 7.0))
+                if baseline:
+                    prev = baseline["total_count"]
+                    diff = total - prev
+                    pct = (diff / prev * 100) if prev else 0.0
+                else:
+                    diff = pct = None
+                sales = await asyncio.to_thread(_buchhaltung_sales_stats, term)
+                results.append({
+                    "term": term, "total": total, "diff": diff, "pct": pct,
+                    "sales": sales, "velocity": velocity,
+                })
+                # Zufällige Pause zwischen den Anfragen – jetzt wo die Markt-Watchlist
+                # mit dazu kommt, sind das deutlich mehr Requests pro Lauf (~70 statt
+                # ~20), daher mehr Abstand um Vinted nicht mit vielen Anfragen in
+                # kurzer Zeit aufzufallen.
+                if i < len(terms) - 1:
+                    await asyncio.sleep(random.uniform(3.5, 7.0))
         return results, blocked
 
     @staticmethod
