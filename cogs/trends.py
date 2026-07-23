@@ -15,11 +15,16 @@ nur deine eigenen Suchbegriffe zeigt, sondern echte Marken-Gewinner über den
 ganzen Vintage-Markt.
 
 Drei Datenquellen im täglichen Update:
-  1. Angebots-Trend (Vinted, deine Snipe-Bot-Kanäle + Markt-Watchlist): wie
-     viele aktive Inserate es pro Marke/Kategorie gerade gibt, und ob das
-     steigt oder fällt. Proxy für Konkurrenz/Interesse, KEINE echte
-     Verkaufszahl – die gibt Vinted öffentlich nicht her.
-  2. "Bei dir am besten weg" (Buchhaltung): wie viele deiner eigenen Artikel
+  1. ⚡ Verkaufsgeschwindigkeit (Vinted, deine Snipe-Bot-Kanäle + Markt-Watchlist):
+     das Hauptsignal. Trackt einzelne Artikel-IDs pro Marke über Zeit — wenn ein
+     zuvor gesehener Artikel aus den Suchergebnissen verschwindet, gilt das als
+     Proxy für "verkauft/entfernt". Durchschnittliche Verweildauer bis zum
+     Verschwinden = wie schnell sich eine Marke typischerweise verkauft. Braucht
+     ein paar Tage Historie, bevor genug Datenpunkte da sind.
+  2. Angebots-Trend (Zusatzsignal): wie viele aktive Inserate es pro Marke/
+     Kategorie gerade gibt, und ob das steigt oder fällt. Nur ein grober Proxy
+     für Konkurrenz/Interesse, KEINE echte Verkaufszahl.
+  3. "Bei dir am besten weg" (Buchhaltung): wie viele deiner eigenen Artikel
      mit passendem Namen tatsächlich verkauft wurden und wie schnell –
      das sind echte Verkäufe, kein Proxy.
 
@@ -107,6 +112,20 @@ def _init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tracked_items (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            term            TEXT NOT NULL,
+            item_id         TEXT NOT NULL,
+            title           TEXT,
+            first_seen      TEXT NOT NULL,
+            last_confirmed  TEXT NOT NULL,
+            disappeared_at  TEXT,
+            UNIQUE(term, item_id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -145,6 +164,85 @@ def _insert_snapshot(term: str, total: int) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def _upsert_seen_items(term: str, items: list[dict]) -> None:
+    """Merkt sich neu gesehene Artikel-IDs pro Begriff (Grundlage für die
+    Verkaufsgeschwindigkeits-Analyse) und aktualisiert bei schon bekannten,
+    noch aktiven Artikeln den 'zuletzt gesehen'-Zeitstempel. Bereits als
+    verschwunden markierte Artikel werden NICHT wiederbelebt (falls sie
+    z.B. neu eingestellt/relistet wurden, zählt das als neuer Datenpunkt,
+    nicht als Korrektur des alten)."""
+    if not items:
+        return
+    now = _now_iso()
+    conn = _connect()
+    for it in items:
+        conn.execute(
+            """
+            INSERT INTO tracked_items (term, item_id, title, first_seen, last_confirmed, disappeared_at)
+            VALUES (?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(term, item_id) DO UPDATE SET last_confirmed = excluded.last_confirmed
+            WHERE disappeared_at IS NULL
+            """,
+            (term, it["id"], it["title"], now, now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _mark_disappeared(term: str, active_ids: set[str]) -> int:
+    """Kern der Verkaufsgeschwindigkeits-Analyse: markiert alle bisher als
+    aktiv geführten Artikel eines Begriffs, die JETZT nicht mehr in den
+    Suchergebnissen auftauchen, als 'verschwunden' (Proxy für verkauft oder
+    vom Verkäufer entfernt). Gibt die Anzahl neu markierter Artikel zurück."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT item_id FROM tracked_items WHERE term = ? AND disappeared_at IS NULL",
+        (term,),
+    ).fetchall()
+    to_mark = [r["item_id"] for r in rows if r["item_id"] not in active_ids]
+    now = _now_iso()
+    for item_id in to_mark:
+        conn.execute(
+            "UPDATE tracked_items SET disappeared_at = ? WHERE term = ? AND item_id = ?",
+            (now, term, item_id),
+        )
+    if to_mark:
+        conn.commit()
+    conn.close()
+    return len(to_mark)
+
+
+def _velocity_stats(term: str, since_days: int = 30, min_sample: int = 3) -> dict | None:
+    """Durchschnittliche Verweildauer (in Tagen) bis ein Artikel dieses Begriffs
+    aus den Suchergebnissen verschwunden ist — je niedriger, desto schneller
+    geht's typischerweise weg. Das ist die eigentlich aussagekräftige
+    'was verkauft sich gut'-Kennzahl (statt nur roher Angebots-Anzahl). Gibt
+    None zurück, wenn noch zu wenige Datenpunkte da sind (min_sample)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    conn = _connect()
+    rows = conn.execute(
+        """
+        SELECT first_seen, disappeared_at FROM tracked_items
+        WHERE term = ? AND disappeared_at IS NOT NULL AND disappeared_at >= ?
+        """,
+        (term, cutoff),
+    ).fetchall()
+    conn.close()
+    if len(rows) < min_sample:
+        return None
+    days = []
+    for r in rows:
+        try:
+            fs = datetime.fromisoformat(r["first_seen"])
+            da = datetime.fromisoformat(r["disappeared_at"])
+            days.append((da - fs).total_seconds() / 86400)
+        except (ValueError, TypeError):
+            continue
+    if len(days) < min_sample:
+        return None
+    return {"avg_days": sum(days) / len(days), "sample": len(days)}
 
 
 def _add_watchlist(term: str, added_by: str) -> bool:
@@ -193,7 +291,7 @@ def _auto_terms() -> list[str]:
 # Breite Markt-Abdeckung, unabhängig davon was du selbst gerade snipst –
 # Vinted bietet KEINE echte "was ist gerade angesagt"-Funktion an (keine
 # öffentliche Trending-API, nur Suche pro Begriff). Das hier ist die
-# nächstbeste Annäherung: eine große, feste Liste bekannter Vintage-/Streetwear-
+# nächstbeste Annäherung: eine große Liste bekannter Vintage-/Streetwear-
 # Resale-Marken wird mitgetrackt, damit die tägliche Bewegung nicht nur
 # deine eigenen Suchbegriffe zeigt, sondern die größten Marken-Gewinner
 # über den ganzen Vintage-Markt hinweg – ohne dass du selbst was eingeben musst.
@@ -273,7 +371,12 @@ class TrendsError(Exception):
     pass
 
 
-async def _fetch_total_count(term: str) -> int:
+async def _fetch_search(term: str) -> tuple[int, list[dict]]:
+    """Sucht den Begriff auf Vinted, gibt (total_entries, items) zurück. items
+    ist eine Liste von {"id": str, "title": str} (bis zu 20, aus derselben
+    Anfrage) — wird sowohl für den Angebots-Zähler als auch fürs
+    Verkaufsgeschwindigkeits-Tracking (siehe _upsert_seen_items/_mark_disappeared)
+    genutzt, damit wir nicht doppelt so viele Anfragen brauchen."""
     # Import hier drin (nicht am Modulanfang), aus demselben Grund wie in
     # price_check.py: vinted_bot.py ist zur Ladezeit dieser Cog evtl. noch
     # nicht vollständig initialisiert.
@@ -283,12 +386,9 @@ async def _fetch_total_count(term: str) -> int:
     proxy_url = p["url"] if p else None
     proxy_auth = p["auth"] if p else None
 
-    # per_page bewusst auf 20 statt 1 gesetzt und sonst identisch zu den
-    # echten Snipe-Bot-URLs aufgebaut: ein "per_page=1"-Request sieht für
-    # Vinteds Anti-Bot-Erkennung sehr untypisch aus (das macht kein echter
-    # Browser), und wurde vermutlich deswegen sofort mit einer generischen
-    # Fallback-Antwort abgespeist statt echten Zahlen — das würde erklären,
-    # warum selbst der 1./2. Request in einem frischen Lauf schon betroffen war.
+    # per_page bewusst auf 20 (nicht 1) und sonst identisch zu den echten
+    # Snipe-Bot-URLs aufgebaut: ein "per_page=1"-Request sieht für Vinteds
+    # Anti-Bot-Erkennung untypisch aus (das macht kein echter Browser).
     params = {
         "search_text": term,
         "per_page": "20",
@@ -313,7 +413,11 @@ async def _fetch_total_count(term: str) -> int:
             data = await r.json()
             pagination = data.get("pagination") or {}
             total = pagination.get("total_entries")
-            items = data.get("items", [])
+            raw_items = data.get("items", [])
+            items = [
+                {"id": str(it["id"]), "title": str(it.get("title") or "")}
+                for it in raw_items if it.get("id") is not None
+            ]
             # Sanity-Check: meldet Vinted z.B. 960 Treffer, liefert aber gar
             # keine Items zurück (obwohl per_page=20 bis zu 20 anfordert), ist
             # das sehr wahrscheinlich eine generische Fallback-/Blocker-Antwort
@@ -325,10 +429,16 @@ async def _fetch_total_count(term: str) -> int:
                         f"Verdächtige Antwort: {total} Treffer gemeldet, aber 0 Items geliefert "
                         "(vermutlich Block/Fallback-Antwort)."
                     )
-                return int(total)
+                return int(total), items
             # Fallback falls Vinted mal kein pagination-Feld liefert – grobe
             # Schätzung über die zurückgegebene Item-Liste.
-            return len(items)
+            return len(items), items
+
+
+async def _fetch_total_count(term: str) -> int:
+    """Kompatibilitäts-Wrapper für den Ad-hoc-Command !trends (braucht nur die Zahl)."""
+    total, _ = await _fetch_search(term)
+    return total
 
 
 class Trends(commands.Cog):
@@ -512,7 +622,7 @@ class Trends(commands.Cog):
         blocked = False
         for i, term in enumerate(terms):
             try:
-                total = await _fetch_total_count(term)
+                total, items = await _fetch_search(term)
             except Exception:
                 log.warning(f"Trend-Check für '{term}' fehlgeschlagen, überspringe.")
                 continue
@@ -535,6 +645,15 @@ class Trends(commands.Cog):
 
             baseline = await asyncio.to_thread(baseline_fn, term)
             await asyncio.to_thread(_insert_snapshot, term, total)
+
+            # Verkaufsgeschwindigkeits-Tracking: neu gesehene Artikel merken,
+            # und Artikel, die aus den Suchergebnissen verschwunden sind
+            # (= vermutlich verkauft/entfernt) entsprechend markieren.
+            active_ids = {it["id"] for it in items}
+            await asyncio.to_thread(_upsert_seen_items, term, items)
+            await asyncio.to_thread(_mark_disappeared, term, active_ids)
+            velocity = await asyncio.to_thread(_velocity_stats, term)
+
             if baseline:
                 prev = baseline["total_count"]
                 diff = total - prev
@@ -542,13 +661,16 @@ class Trends(commands.Cog):
             else:
                 diff = pct = None
             sales = await asyncio.to_thread(_buchhaltung_sales_stats, term)
-            results.append({"term": term, "total": total, "diff": diff, "pct": pct, "sales": sales})
+            results.append({
+                "term": term, "total": total, "diff": diff, "pct": pct,
+                "sales": sales, "velocity": velocity,
+            })
             # Zufällige Pause zwischen den Anfragen – jetzt wo die Markt-Watchlist
             # mit dazu kommt, sind das deutlich mehr Requests pro Lauf (~70 statt
             # ~20), daher mehr Abstand um Vinted nicht mit vielen Anfragen in
             # kurzer Zeit aufzufallen.
             if i < len(terms) - 1:
-                await asyncio.sleep(random.uniform(3.0, 6.0))
+                await asyncio.sleep(random.uniform(3.5, 7.0))
         return results, blocked
 
     @staticmethod
@@ -558,12 +680,36 @@ class Trends(commands.Cog):
         new_terms = [r for r in results if r["pct"] is None]
 
         embed = discord.Embed(title=title, color=COLOR)
+
+        # Verkaufsgeschwindigkeit zuerst — das ist die eigentlich aussagekräftige
+        # "was verkauft sich gut"-Kennzahl (wie schnell verschwinden Angebote
+        # wieder aus der Suche = Proxy fürs Verkaufen), nicht nur eine rohe
+        # Angebots-Anzahl. Sortiert aufsteigend: am schnellsten weg zuerst.
+        velos = [r for r in results if r.get("velocity")]
+        velos.sort(key=lambda r: r["velocity"]["avg_days"])
+        if velos:
+            lines = []
+            for r in velos[:12]:
+                v = r["velocity"]
+                lines.append(f"⚡ **{r['term']}** — ⌀ {v['avg_days']:.1f}d bis weg ({v['sample']} Artikel)")
+            embed.add_field(
+                name="⚡ Verkaufsgeschwindigkeit (je schneller weg, desto gefragter)",
+                value="\n".join(lines), inline=False,
+            )
+        else:
+            embed.add_field(
+                name="⚡ Verkaufsgeschwindigkeit",
+                value="Noch nicht genug Daten — braucht ein paar Tage Tracking-Historie pro Begriff, "
+                      "das baut sich von selbst auf.",
+                inline=False,
+            )
+
         if movers:
             lines = []
-            for r in movers[:15]:
+            for r in movers[:10]:
                 emoji = "📈" if r["diff"] > 0 else "📉" if r["diff"] < 0 else "➖"
                 lines.append(f"{emoji} **{r['term']}** — {r['total']} Angebote ({r['pct']:+.1f}%)")
-            embed.add_field(name="📡 Angebots-Bewegung (Vinted)", value="\n".join(lines), inline=False)
+            embed.add_field(name="📡 Angebots-Bewegung (Zusatzsignal)", value="\n".join(lines), inline=False)
         if new_terms:
             lines = [f"• **{r['term']}** — {r['total']} Angebote ({no_baseline_label})" for r in new_terms[:15]]
             embed.add_field(name="Noch kein Vergleichswert", value="\n".join(lines), inline=False)
@@ -580,7 +726,11 @@ class Trends(commands.Cog):
                 lines.append(f"🏆 **{r['term']}** — {s['anzahl_verkauft']}x verkauft{tage}")
             embed.add_field(name="Bei dir am besten weg (echte Verkäufe)", value="\n".join(lines), inline=False)
 
-        footer = "Angebots-Bewegung = Proxy für Konkurrenz/Interesse. Echte Verkäufe kommen aus deiner Buchhaltung."
+        footer = (
+            "⚡ Verkaufsgeschwindigkeit = wie schnell Angebote aus der Suche verschwinden "
+            "(verkauft/entfernt) — Hauptsignal fürs Einkaufen. Angebots-Bewegung = Zusatzsignal "
+            "für Konkurrenz. Echte Verkäufe kommen aus deiner Buchhaltung."
+        )
         if blocked:
             footer = (
                 "⚠️ Lauf vorzeitig abgebrochen — Vinted hat vermutlich geblockt (zu viele Anfragen). "
