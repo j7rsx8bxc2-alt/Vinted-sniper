@@ -245,7 +245,34 @@ def _velocity_stats(term: str, since_days: int = 30, min_sample: int = 3) -> dic
     return {"avg_days": sum(days) / len(days), "sample": len(days)}
 
 
-def _add_watchlist(term: str, added_by: str) -> bool:
+def _top_velocity(limit: int = 5, since_days: int = 30, min_sample: int = 2) -> list[dict]:
+    """Für andere Cogs (z.B. Content-Ideen-Bot): die Begriffe mit aktuell der
+    schnellsten Verkaufsgeschwindigkeit (niedrigste Verweildauer) über alle
+    getrackten Marken hinweg, nicht nur für einen einzelnen Begriff."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    conn = _connect()
+    rows = conn.execute(
+        """
+        SELECT term, first_seen, disappeared_at FROM tracked_items
+        WHERE disappeared_at IS NOT NULL AND disappeared_at >= ?
+        """,
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    per_term: dict[str, list[float]] = {}
+    for r in rows:
+        try:
+            fs = datetime.fromisoformat(r["first_seen"])
+            da = datetime.fromisoformat(r["disappeared_at"])
+            per_term.setdefault(r["term"], []).append((da - fs).total_seconds() / 86400)
+        except (ValueError, TypeError):
+            continue
+    stats = [
+        {"term": term, "avg_days": sum(days) / len(days), "sample": len(days)}
+        for term, days in per_term.items() if len(days) >= min_sample
+    ]
+    stats.sort(key=lambda s: s["avg_days"])
+    return stats[:limit]def _add_watchlist(term: str, added_by: str) -> bool:
     conn = _connect()
     try:
         conn.execute(
