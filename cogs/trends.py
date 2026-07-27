@@ -272,7 +272,10 @@ def _top_velocity(limit: int = 5, since_days: int = 30, min_sample: int = 2) -> 
         for term, days in per_term.items() if len(days) >= min_sample
     ]
     stats.sort(key=lambda s: s["avg_days"])
-    return stats[:limit]def _add_watchlist(term: str, added_by: str) -> bool:
+    return stats[:limit]
+
+
+def _add_watchlist(term: str, added_by: str) -> bool:
     conn = _connect()
     try:
         conn.execute(
