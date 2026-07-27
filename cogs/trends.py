@@ -64,7 +64,7 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-from .access import is_vip_or_admin
+from .access import is_vip_or_admin_ctx
 
 log = logging.getLogger("trends")
 
@@ -489,7 +489,7 @@ class Trends(commands.Cog):
         self.weekly_recap_loop.cancel()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return is_vip_or_admin(ctx.author)
+        return await is_vip_or_admin_ctx(ctx)
 
     @staticmethod
     def _term_key(text: str) -> str:
