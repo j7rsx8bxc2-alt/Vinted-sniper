@@ -49,7 +49,8 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from .access import is_vip_or_admin
+from .access import is_vip_or_admin_ctx
+
 from .ai_vision import describe_garment
 
 log = logging.getLogger("tryon")
@@ -86,7 +87,7 @@ class TryOn(commands.Cog):
         self.active: set[int] = set()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return is_vip_or_admin(ctx.author)
+        return await is_vip_or_admin_ctx(ctx)
 
     async def _wait_for_image(self, ctx: commands.Context, prompt: str) -> bytes | None:
         await ctx.send(prompt)
