@@ -18,7 +18,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from .access import is_vip_or_admin
+from .access import is_vip_or_admin_ctx
 from .ai_vision import AIVisionError, build_photo_check_embed, check_photo_quality
 from .openrouter_client import is_enabled
 
@@ -32,7 +32,7 @@ class PhotoCheck(commands.Cog):
         self.bot = bot
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return is_vip_or_admin(ctx.author)
+        return await is_vip_or_admin_ctx(ctx)
 
     @commands.command(name="fotocheck")
     async def fotocheck(self, ctx: commands.Context):
