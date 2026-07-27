@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands, tasks
 
-from .access import is_vip_or_admin
+from .access import is_vip_or_admin_ctx
 from .openrouter_client import OpenRouterError, chat, is_enabled
 
 log = logging.getLogger("content")
@@ -221,7 +221,7 @@ class Content(commands.Cog):
         self.weekly_content_loop.cancel()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return is_vip_or_admin(ctx.author)
+       return await is_vip_or_admin_ctx(ctx)
 
     @commands.command(name="content-ideen")
     async def content_ideen(self, ctx: commands.Context, anzahl: int = 5):
