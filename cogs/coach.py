@@ -11,7 +11,7 @@ import logging
 import discord
 from discord.ext import commands
 
-from .access import is_vip_or_admin
+from .access import is_vip_or_admin_ctx
 from .openrouter_client import OpenRouterError, chat, is_enabled
 
 log = logging.getLogger("coach")
@@ -49,7 +49,7 @@ class Coach(commands.Cog):
         self.history: dict[int, list[dict]] = {}
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return is_vip_or_admin(ctx.author)
+        return await is_vip_or_admin_ctx(ctx)
 
     @commands.command(name="coach")
     async def coach(self, ctx: commands.Context, *, frage: str = None):
