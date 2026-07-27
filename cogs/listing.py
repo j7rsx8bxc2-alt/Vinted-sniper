@@ -16,7 +16,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from .access import is_vip_or_admin
+from .access import is_vip_or_admin_ctx
 from .ai_vision import AIVisionError, build_photo_check_embed, check_photo_quality, generate_listing
 from .vinted_client import VintedAPIError, VintedClient
 
@@ -38,7 +38,7 @@ class Listing(commands.Cog):
         self.vinted = VintedClient()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return is_vip_or_admin(ctx.author)
+        return await is_vip_or_admin_ctx(ctx)
 
     async def _ask(self, ctx: commands.Context, prompt: str, *, allow_images: bool = False):
         await ctx.send(prompt)
