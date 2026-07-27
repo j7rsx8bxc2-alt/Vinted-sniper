@@ -483,8 +483,7 @@ async def sniper_loop():
 
 # ── Erweiterungen (Listing-Bot, Buchhaltungs-Bot) ────────────────────────────
 EXTENSIONS = ["cogs.buchhaltung", "cogs.listing", "cogs.coach", "cogs.price_check", "cogs.tryon",
-              "cogs.channel_help", "cogs.welcome", "cogs.photo_check", "cogs.trends"]
-
+              "cogs.channel_help", "cogs.welcome", "cogs.photo_check", "cogs.trends", "cogs.content"]
 async def load_extensions():
     for ext in EXTENSIONS:
         try:
