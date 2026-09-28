@@ -281,7 +281,19 @@ async def get_session_cookie(session: aiohttp.ClientSession, proxy_url, proxy_au
         log.debug(f"Cookie-Abruf fehlgeschlagen: {e}")
     return None
 
+def to_api_url(url: str) -> str:
+    """Wandelt eine normale Vinted-Webseiten-URL (vinted.de/catalog?...) in die
+    interne API-URL (vinted.de/api/v2/catalog/items?...) um, falls nötig."""
+    if "/api/v2/catalog/items" in url:
+        return url
+    if "/catalog?" in url:
+        return url.replace("/catalog?", "/api/v2/catalog/items?")
+    if url.rstrip("/").endswith("/catalog"):
+        return url.rstrip("/").replace("/catalog", "/api/v2/catalog/items")
+    return url
+
 async def fetch_items(session: aiohttp.ClientSession, url: str, retries: int = 3) -> list:
+    url = to_api_url(url)
     for attempt in range(retries):
         p = get_random_proxy()
         proxy_url  = p["url"]  if p else None
