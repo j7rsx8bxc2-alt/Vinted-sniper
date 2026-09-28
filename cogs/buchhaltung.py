@@ -108,7 +108,7 @@ class Buchhaltung(commands.Cog):
         self.check_sold_loop.cancel()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return await is_vip_or_admin_ctx(ctx)
+      return await is_vip_or_admin_ctx(ctx)
 
     # ── Einkauf ──────────────────────────────────────────────────────────────
     @commands.command(name="kauf")

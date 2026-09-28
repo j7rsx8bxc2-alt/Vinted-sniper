@@ -221,7 +221,7 @@ class Content(commands.Cog):
         self.weekly_content_loop.cancel()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        return await is_vip_or_admin_ctx(ctx)
+       return await is_vip_or_admin_ctx(ctx)
 
     @commands.command(name="content-ideen")
     async def content_ideen(self, ctx: commands.Context, anzahl: int = 5):

@@ -69,3 +69,4 @@ async def chat(messages: list[dict], *, temperature: float = 0.4,
     except (KeyError, IndexError) as e:
         log.error(f"Konnte OpenRouter-Antwort nicht lesen: {e} — Rohdaten: {str(data)[:400]}")
         raise OpenRouterError("Antwort der KI konnte nicht gelesen werden.")
+  
