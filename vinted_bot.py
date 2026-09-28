@@ -9,6 +9,10 @@ import logging
 from collections import deque
 from dotenv import load_dotenv
 
+from cogs.access import admin_only
+from cogs.ai_vision import assess_grail
+from cogs.openrouter_client import is_enabled as ai_enabled
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -20,8 +24,8 @@ log = logging.getLogger("vinted-bot")
 # ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN          = os.getenv("DISCORD_TOKEN")
-PROXIES_FILE   = "proxies.txt"   # Format pro Zeile: ip:port:username:password
-URLS_FILE      = "monitor_urls.json"
+PROXIES_FILE   = os.getenv("PROXIES_FILE", "proxies.txt")   # Format pro Zeile: ip:port:username:password
+URLS_FILE      = os.getenv("MONITOR_URLS_FILE", "monitor_urls.json")
 MAX_SEEN       = 10_000
 
 def load_proxy_pool() -> list[dict]:
@@ -70,6 +74,9 @@ def load_monitors():
     return {m: [] for m in DEFAULT_MONITORS}
 
 def save_monitors(monitors):
+    dirname = os.path.dirname(URLS_FILE)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     with open(URLS_FILE, "w") as f:
         json.dump(monitors, f, indent=2)
 
@@ -81,6 +88,7 @@ _active_session: aiohttp.ClientSession | None = None  # wird beim Start des Snip
 # ── Bot ───────────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # nötig damit on_member_join (Willkommensnachricht) feuert
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ── Buttons ───────────────────────────────────────────────────────────────────
@@ -118,13 +126,19 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure):
+        # Stille Ablehnung: keine Berechtigung -> keine Fehlermeldung im Chat
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Fehlende Argumente. Tippe `!help` für eine Übersicht.")
     else:
         log.error(f"Command-Fehler: {error}")
 
 # ── Commands ──────────────────────────────────────────────────────────────────
+# Nur Server-Admins dürfen diese Snipe-Bot-Befehle nutzen, da sie die geteilte
+# Monitor-Konfiguration für den ganzen Server verändern.
 @bot.command()
+@admin_only()
 async def add(ctx, monitor: str, *, url: str):
     monitor = monitor.lower()
     is_new = monitor not in MONITORS
@@ -145,6 +159,7 @@ async def add(ctx, monitor: str, *, url: str):
     await ctx.send(f"✅ {prefix}Suche zu **#{monitor}** hinzugefügt!")
 
 @bot.command()
+@admin_only()
 async def remove(ctx, monitor: str, index: int):
     monitor = monitor.lower()
     if monitor not in MONITORS:
@@ -162,6 +177,7 @@ async def remove(ctx, monitor: str, index: int):
     await ctx.send(f"🗑️ Suche #{index} aus **#{monitor}** entfernt:\n`{removed}`")
 
 @bot.command(name="list")
+@admin_only()
 async def list_monitors(ctx):
     active = {k: v for k, v in MONITORS.items() if v}
     if not active:
@@ -177,6 +193,7 @@ async def list_monitors(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
+@admin_only()
 async def proxy(ctx):
     if PROXY_POOL:
         embed = discord.Embed(title="🌐 Proxy-Status", color=0x00C853)
@@ -200,6 +217,30 @@ async def help_cmd(ctx):
         value="`polos` `trackpants` `tracksuits` `pullover` `schuhe`\n"
               "`nike` `lacoste` `ralph-lauren` `blauer` `levis` `armani`\n"
               "`lamartina` `burberry` `true-religion` `miss-me` `versace` `fred-perry`",
+        inline=False
+    )
+    embed.add_field(
+        name="🛍️ Listing & 🧾 Buchhaltung",
+        value="`!inserat` – neues Verkaufs-Listing erstellen\n"
+              "`!buchhaltung` – alle Buchhaltungs-Commands anzeigen",
+        inline=False
+    )
+    embed.add_field(
+        name="🎓 Coach & 💶 Preis-Check",
+        value="`!coach <Frage>` – Reselling-Tipps von der KI\n"
+              "`!preischeck <Suchbegriff>` – Preisspanne ähnlicher Vinted-Angebote",
+        inline=False
+    )
+    embed.add_field(
+        name="🧍 Virtual Try-On (experimentell)",
+        value="`!tryon` – Kleidungsstück auf ein Model-Foto ziehen\n"
+              "`!tryon-modelle` – zeigt hinterlegte Model-Fotos an",
+        inline=False
+    )
+    embed.add_field(
+        name="📸 Foto-Check & 📡 Trend-Radar",
+        value="`!fotocheck` – KI bewertet Fotos vorm Posten (läuft auch automatisch in `!inserat`)\n"
+              "`!trends <Suchbegriff>` – Trend-Check jetzt, `!trends-hilfe` für alle Watchlist-Commands",
         inline=False
     )
     await ctx.send(embed=embed)
@@ -306,7 +347,8 @@ def format_price(amount, currency) -> str:
         return f"{amount} {currency}"
 
 # ── Embed mit Buttons und Bilder-Grid ──────────────────────────────────────────
-async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str):
+async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str,
+                     session: aiohttp.ClientSession | None = None):
     item_id    = str(item.get("id", "?"))
     title      = item.get("title", "Unbekannter Artikel")
     amount, currency = extract_price(item)
@@ -330,13 +372,35 @@ async def send_item(channel: discord.TextChannel, item: dict, monitor_name: str)
 
     rating_stars = round(float(rating_raw) * 5, 1)
 
+    # ── Grail-Erkennung: KI schätzt anhand des ersten Fotos ein, ob der Fund
+    # ungewöhnlich selten/begehrt ist (Limited Edition, seltene Colorway, Kult-Stück).
+    # Best-effort: läuft nur wenn ein OpenRouter-Key gesetzt ist, und ein Fehler
+    # hier darf den Sniper nie blockieren – der Fund wird dann einfach ganz normal
+    # ohne 🔥-Badge gepostet.
+    grail = None
+    if photo_urls and session is not None and ai_enabled():
+        try:
+            async with session.get(
+                photo_urls[0], timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    img_bytes = await r.read()
+                    grail = await assess_grail(img_bytes, title, brand)
+        except Exception as e:
+            log.debug(f"Grail-Check Foto-Download fehlgeschlagen: {e}")
+
+    is_grail = bool(grail and grail.get("is_grail"))
+    title_prefix = "🔥 " if is_grail else ""
+
     # ── Hauptembed: Verkäufer + Titel + Beschreibung ────────────────────────────
     embed = discord.Embed(
-        title=f"{flag} {title} | {amount} {currency}",
+        title=f"{title_prefix}{flag} {title} | {amount} {currency}",
         url=item_url,
         description=f"👤 **{seller}**",
-        color=0x09B1BA
+        color=0xFFD700 if is_grail else 0x09B1BA
     )
+    if is_grail and grail.get("grund"):
+        embed.add_field(name="🔥 Seltener Fund", value=grail["grund"], inline=False)
     embed.add_field(name="📅 Aktualisiert", value="Gerade eben", inline=True)
     embed.add_field(name="📏 Größe",        value=size,           inline=True)
     embed.add_field(name="🏷️ Marke",        value=brand,          inline=True)
@@ -397,7 +461,7 @@ async def monitor_loop(session: aiohttp.ClientSession, monitor_name: str):
                             seen_set.discard(seen_items[0])
                         seen_items.append(item_id)
                         seen_set.add(item_id)
-                        await send_item(channel, item, monitor_name)
+                        await send_item(channel, item, monitor_name, session=session)
             except Exception as e:
                 log.error(f"[{monitor_name}] Fehler: {e}")
             # Moderate Pause je URL innerhalb eines Monitors
@@ -417,9 +481,26 @@ async def sniper_loop():
         await asyncio.gather(*tasks)
 
 
+# ── Erweiterungen (Listing-Bot, Buchhaltungs-Bot) ────────────────────────────
+EXTENSIONS = ["cogs.buchhaltung", "cogs.listing", "cogs.coach", "cogs.price_check", "cogs.tryon",
+              "cogs.channel_help", "cogs.welcome", "cogs.photo_check", "cogs.trends", "cogs.content"]
+
+async def load_extensions():
+    for ext in EXTENSIONS:
+        try:
+            await bot.load_extension(ext)
+            log.info(f"🧩 Erweiterung geladen: {ext}")
+        except Exception:
+            log.exception(f"❌ Erweiterung konnte nicht geladen werden: {ext}")
+
 # ── Start ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+async def main():
     if not TOKEN:
         log.critical("❌ DISCORD_TOKEN fehlt!")
         raise SystemExit(1)
-    bot.run(TOKEN)
+    async with bot:
+        await load_extensions()
+        await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())

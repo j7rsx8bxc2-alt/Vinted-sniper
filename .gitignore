@@ -1,6 +1,7 @@
 # Secrets – NIEMALS committen!
 .env
 monitor_urls.json
+*.db
 
 # Python
 __pycache__/
