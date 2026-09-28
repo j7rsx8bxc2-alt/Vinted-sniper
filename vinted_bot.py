@@ -300,6 +300,10 @@ async def fetch_items(session: aiohttp.ClientSession, url: str, retries: int = 3
                 timeout=aiohttp.ClientTimeout(total=12)
             ) as r:
                 if r.status == 200:
+                    content_type = r.headers.get("Content-Type", "")
+                    if "application/json" not in content_type:
+                        log.warning("HTML statt JSON erhalten (Anti-Bot-Seite) → versuche anderen Proxy...")
+                        continue
                     data = await r.json()
                     return data.get("items", [])[:8]
                 elif r.status == 429:
